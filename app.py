@@ -24,8 +24,7 @@ from gpa.graficos import (
     grafico_tendencia_gpa_por_disciplina_turma,
     grafico_tendencia_gpa_por_estudante_disciplina,
 )
-# NOVO: utilitários para GitHub (excluir arquivo do repo)
-from gpa.github_api import (
+from gpa.github_api import (  # opcional: exclusão no GitHub
     gh_credentials_ok,
     gh_delete_file_from_repo,
     gh_credentials_summary,
@@ -120,7 +119,7 @@ with ccon:
     rotulos_conclusiva = [s.strip() for s in texto_conc.split(",") if s.strip()]
 
 # -------------------------
-# 3) Tabela de conversão Média → GPA
+# 3) Tabela de conversão e ESCALA
 # -------------------------
 st.header("3) Tabela de conversão de Média → GPA (edite se necessário)")
 
@@ -136,6 +135,15 @@ tabela_map = st.data_editor(
     },
     key="gpa_editor",
 )
+
+st.subheader("Escala das suas notas/médias")
+escala_sel = st.radio(
+    "Como estão as notas no arquivo?",
+    ["Auto (detectar)", "0–10", "0–100"],
+    horizontal=True,
+    index=0,
+)
+escala_param = "auto" if "Auto" in escala_sel else ("0-10" if escala_sel == "0–10" else "0-100")
 
 # -------------------------
 # 4) Processar & Salvar
@@ -183,8 +191,8 @@ if st.button("Processar arquivo", type="primary", disabled=(arquivo is None)):
         rotulos_conclusiva=rotulos_conclusiva,
     )
 
-    # 2) Aplicar mapeamento Média → GPA
-    gpa_df = aplicar_mapeamento_gpa(medias, tabela_map)
+    # 2) Aplicar mapeamento Média → GPA (com padronização de escala)
+    gpa_df = aplicar_mapeamento_gpa(medias, tabela_map, escala=escala_param)
 
     # 3) Persistir dados
     ts = time.strftime("%Y%m%d-%H%M%S")
@@ -204,7 +212,6 @@ st.divider()
 st.header("5) Gerenciar dados (Excluir)")
 
 def listar_arquivos(pasta: str):
-    """Retorna lista de caminhos completos dos arquivos na pasta (apenas arquivos)."""
     if not os.path.isdir(pasta):
         return []
     full = [os.path.join(pasta, f) for f in os.listdir(pasta)]
@@ -218,7 +225,6 @@ with col_g:
     if not arquivos:
         st.info("Nenhum arquivo encontrado em `./data`. Processe um arquivo para gerar resultados.")
     else:
-        # Tabela informativa
         infos = []
         for p in arquivos:
             try:
@@ -235,7 +241,6 @@ with col_g:
         df_infos = pd.DataFrame(infos)
         st.dataframe(df_infos, use_container_width=True, hide_index=True)
 
-        # Seleção para exclusão
         opcoes = [os.path.basename(p) for p in arquivos]
         selecao = st.multiselect("Selecione arquivos para excluir", opcoes, default=[])
 
@@ -250,15 +255,11 @@ with col_g:
         if st.button("Excluir selecionados", type="secondary", disabled=(len(selecao) == 0)):
             sucesso_local = 0
             sucesso_gh = 0
-
             for nome_arq in selecao:
                 full_path = os.path.join(diretorio_salvar, nome_arq)
-                # Segurança: só permitir exclusão dentro da pasta de dados
                 if not os.path.abspath(full_path).startswith(os.path.abspath(diretorio_salvar) + os.sep):
                     st.error(f"Bloqueado (fora da pasta de dados): {full_path}")
                     continue
-
-                # Excluir localmente
                 try:
                     os.remove(full_path)
                     sucesso_local += 1
@@ -267,10 +268,7 @@ with col_g:
                     st.warning(f"Arquivo já não existe localmente: {full_path}")
                 except Exception as e:
                     st.error(f"Falha ao excluir localmente {full_path}: {e}")
-
-                # Excluir no GitHub (opcional)
                 if excluir_github and gh_ok:
-                    # Caminho relativo do repo (ex.: data/arquivo.csv)
                     rel_path = os.path.relpath(full_path, start=".")
                     ok, status_msg = gh_delete_file_from_repo(rel_path, message=f"chore: remove {rel_path} via app")
                     if ok:
@@ -278,7 +276,6 @@ with col_g:
                         st.success(f"Excluído do GitHub: {rel_path}")
                     else:
                         st.error(f"Falha ao excluir do GitHub {rel_path}: {status_msg}")
-
             st.info(f"Resumo: {sucesso_local} excluído(s) localmente; {sucesso_gh} excluído(s) no GitHub.")
 
 with col_info:

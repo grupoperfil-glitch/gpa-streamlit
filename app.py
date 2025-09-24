@@ -1,18 +1,4 @@
-# app.py — Aplicação Streamlit (PT-BR) para converter Notas → GPA
-# Requisitos: ver requirements.txt
-# Estrutura esperada do repo:
-# .
-# ├─ app.py
-# ├─ requirements.txt
-# ├─ .streamlit/config.toml
-# ├─ gpa/
-# │  ├─ __init__.py
-# │  ├─ config.py
-# │  ├─ io.py
-# │  ├─ processamento.py
-# │  └─ graficos.py
-# └─ data/.gitkeep
-
+# app.py — Aplicação Streamlit (PT-BR) para converter Notas → GPA e gerenciar exclusões
 import os
 import time
 import pandas as pd
@@ -38,8 +24,16 @@ from gpa.graficos import (
     grafico_tendencia_gpa_por_disciplina_turma,
     grafico_tendencia_gpa_por_estudante_disciplina,
 )
+# NOVO: utilitários para GitHub (excluir arquivo do repo)
+from gpa.github_api import (
+    gh_credentials_ok,
+    gh_delete_file_from_repo,
+    gh_credentials_summary,
+)
 
+# -------------------------
 # Configuração da página
+# -------------------------
 st.set_page_config(page_title="Conversor de Notas → GPA", layout="wide")
 st.title("Conversor de Notas → GPA (Streamlit)")
 st.caption("Se suas notas usam vírgula decimal, a aplicação converte automaticamente.")
@@ -56,16 +50,13 @@ arquivo = st.file_uploader("Selecione um arquivo CSV/XLSX", type=["csv", "xlsx",
 st.header("2) Mapeie as colunas do seu arquivo")
 
 amostra_colunas = ["Nome", "Turma", "DescrMateria", "DescrAvaliacao", "Nota", "Trimestre"]
-
 if arquivo is not None:
-    # Pré-visualização (apenas primeiras linhas)
     df_preview = leitura_robusta(arquivo, nrows=200)
     amostra_colunas = list(df_preview.columns)
     st.dataframe(df_preview.head(20), use_container_width=True)
 else:
     st.info("Faça upload de um arquivo para visualizar as colunas detectadas.")
 
-# Seletores de colunas (fora do bloco if/else acima)
 esquema = ESQUEMA_PADRAO.copy()
 
 c1, c2, c3 = st.columns(3)
@@ -155,14 +146,11 @@ st.caption("Todos os dados ficarão em ./data (por padrão).")
 
 if st.button("Processar arquivo", type="primary", disabled=(arquivo is None)):
     garantir_diretorio(diretorio_salvar)
-
-    # MUITO IMPORTANTE: reposiciona o ponteiro do arquivo antes da leitura final
     try:
         arquivo.seek(0)
     except Exception:
         pass
 
-    # Leitura completa do arquivo
     df = leitura_robusta(arquivo)
 
     # Normalização de nota (vírgula → ponto)
@@ -175,7 +163,7 @@ if st.button("Processar arquivo", type="primary", disabled=(arquivo is None)):
     else:
         df["Trimestre"] = trimestre_constante
 
-    # Renomear colunas principais para nomes internos padronizados
+    # Renomear colunas principais
     df = df.rename(
         columns={
             coluna_nome: "Estudante",
@@ -206,13 +194,103 @@ if st.button("Processar arquivo", type="primary", disabled=(arquivo is None)):
 
     st.success(f"Arquivo processado e salvo em {caminho_saida}")
     st.dataframe(gpa_df.head(50), use_container_width=True)
-
     st.session_state["_ultimo_arquivo_processado"] = caminho_saida
 
 st.divider()
 
 # -------------------------
-# Dashboard
+# 5) Gerenciar dados (Excluir)
+# -------------------------
+st.header("5) Gerenciar dados (Excluir)")
+
+def listar_arquivos(pasta: str):
+    """Retorna lista de caminhos completos dos arquivos na pasta (apenas arquivos)."""
+    if not os.path.isdir(pasta):
+        return []
+    full = [os.path.join(pasta, f) for f in os.listdir(pasta)]
+    return sorted([p for p in full if os.path.isfile(p)])
+
+col_g, col_info = st.columns([2, 1])
+with col_g:
+    st.write(f"Diretório atual: `{diretorio_salvar}`")
+    arquivos = listar_arquivos(diretorio_salvar)
+
+    if not arquivos:
+        st.info("Nenhum arquivo encontrado em `./data`. Processe um arquivo para gerar resultados.")
+    else:
+        # Tabela informativa
+        infos = []
+        for p in arquivos:
+            try:
+                size = os.path.getsize(p)
+                mtime = os.path.getmtime(p)
+            except Exception:
+                size, mtime = None, None
+            infos.append({
+                "arquivo": os.path.basename(p),
+                "caminho": p,
+                "tamanho_bytes": size,
+                "modificado_em": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime)) if mtime else "",
+            })
+        df_infos = pd.DataFrame(infos)
+        st.dataframe(df_infos, use_container_width=True, hide_index=True)
+
+        # Seleção para exclusão
+        opcoes = [os.path.basename(p) for p in arquivos]
+        selecao = st.multiselect("Selecione arquivos para excluir", opcoes, default=[])
+
+        excluir_github = st.checkbox("Excluir também do GitHub (se configurado em Secrets)", value=False)
+        gh_ok, gh_err = gh_credentials_ok()
+        if excluir_github:
+            if gh_ok:
+                st.success(f"GitHub Secrets OK — {gh_credentials_summary()}")
+            else:
+                st.warning(f"Secrets do GitHub ausentes/incompletos: {gh_err}")
+
+        if st.button("Excluir selecionados", type="secondary", disabled=(len(selecao) == 0)):
+            sucesso_local = 0
+            sucesso_gh = 0
+
+            for nome_arq in selecao:
+                full_path = os.path.join(diretorio_salvar, nome_arq)
+                # Segurança: só permitir exclusão dentro da pasta de dados
+                if not os.path.abspath(full_path).startswith(os.path.abspath(diretorio_salvar) + os.sep):
+                    st.error(f"Bloqueado (fora da pasta de dados): {full_path}")
+                    continue
+
+                # Excluir localmente
+                try:
+                    os.remove(full_path)
+                    sucesso_local += 1
+                    st.success(f"Excluído localmente: {full_path}")
+                except FileNotFoundError:
+                    st.warning(f"Arquivo já não existe localmente: {full_path}")
+                except Exception as e:
+                    st.error(f"Falha ao excluir localmente {full_path}: {e}")
+
+                # Excluir no GitHub (opcional)
+                if excluir_github and gh_ok:
+                    # Caminho relativo do repo (ex.: data/arquivo.csv)
+                    rel_path = os.path.relpath(full_path, start=".")
+                    ok, status_msg = gh_delete_file_from_repo(rel_path, message=f"chore: remove {rel_path} via app")
+                    if ok:
+                        sucesso_gh += 1
+                        st.success(f"Excluído do GitHub: {rel_path}")
+                    else:
+                        st.error(f"Falha ao excluir do GitHub {rel_path}: {status_msg}")
+
+            st.info(f"Resumo: {sucesso_local} excluído(s) localmente; {sucesso_gh} excluído(s) no GitHub.")
+
+with col_info:
+    st.markdown("**Observações:**")
+    st.markdown("- A exclusão local remove o arquivo **desta instância** do app (armazenamento efêmero).")
+    st.markdown("- A exclusão no **GitHub** requer Secrets válidos e o arquivo **estar versionado** no repositório.")
+    st.markdown("- Caminhos fora da pasta de dados são **bloqueados** por segurança.")
+
+st.divider()
+
+# -------------------------
+# 6) Dashboard
 # -------------------------
 st.header("Dashboard de Tendências de GPA")
 

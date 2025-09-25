@@ -23,11 +23,24 @@ from gpa.processamento import (
     calcular_media_por_trimestre,
     aplicar_mapeamento_gpa,
 )
-from gpa.graficos import (
-    grafico_tendencia_gpa_por_disciplina_turma,
-    grafico_tendencia_gpa_por_estudante_disciplina,
-    grafico_gpa_individual_estudante_disciplinas,
-)
+
+# Imports dos gráficos com fallback seguro (evita quebra se commit parcial ocorrer)
+try:
+    from gpa.graficos import (
+        grafico_tendencia_gpa_por_disciplina_turma,
+        grafico_tendencia_gpa_por_estudante_disciplina,
+        grafico_gpa_individual_estudante_disciplinas,
+    )
+    _GRAFICO_INDIVIDUAL_OK = True
+except ImportError as _e:
+    from gpa.graficos import (
+        grafico_tendencia_gpa_por_disciplina_turma,
+        grafico_tendencia_gpa_por_estudante_disciplina,
+    )
+    grafico_gpa_individual_estudante_disciplinas = None
+    _GRAFICO_INDIVIDUAL_OK = False
+    _GRAFICOS_IMPORT_ERROR = str(_e)
+
 from gpa.github_api import (
     gh_credentials_ok,
     gh_credentials_summary,
@@ -43,6 +56,34 @@ from gpa.github_api import (
 st.set_page_config(page_title="Conversor de Notas → GPA", layout="wide")
 st.title("Conversor de Notas → GPA (Streamlit)")
 st.caption("Se suas notas usam vírgula decimal, a aplicação converte automaticamente.")
+
+# -------------------------
+# 0) Helpers
+# -------------------------
+def extrair_serie(txt: str) -> str:
+    """Extrai 'Série' a partir do texto de Turma (ex.: '6º ano A' -> '6º ano')."""
+    if not isinstance(txt, str):
+        return ""
+    s = txt.lower().replace("º", "").strip()
+    m = re.search(r"(\d{1,2})\s*ano", s)
+    if m:
+        return f"{int(m.group(1))}º ano"
+    m = re.search(r"^(\d{1,2})", s)  # '9a', '1b', etc.
+    if m:
+        return f"{int(m.group(1))}º ano"
+    return txt
+
+def listar_arquivos(pasta: str):
+    if not os.path.isdir(pasta):
+        return []
+    full = [os.path.join(pasta, f) for f in os.listdir(pasta)]
+    return sorted([p for p in full if os.path.isfile(p)])
+
+def listar_processados_locais(pasta: str):
+    return [
+        p for p in listar_arquivos(pasta)
+        if os.path.basename(p).startswith("processado_") and p.endswith(".csv")
+    ]
 
 # -------------------------
 # 1) Upload
@@ -157,7 +198,7 @@ gh_ok_flag, gh_err_msg = gh_credentials_ok()
 salvar_no_github_flag = st.checkbox(
     "Salvar uma cópia no GitHub após processar (requer Secrets configurados)",
     value=False,
-    help="Usa a API de conteúdos do GitHub para enviar o CSV gerado para a pasta data/ do repositório.",
+    help="Envia o CSV gerado para a pasta data/ do repositório via GitHub API.",
 )
 
 # -------------------------
@@ -222,7 +263,7 @@ if st.button("Processar arquivo", type="primary", disabled=(arquivo is None)):
     # 4) (Opcional) enviar cópia ao GitHub
     if salvar_no_github_flag:
         if gh_ok_flag:
-            rel_path = os.path.relpath(caminho_saida, start=".").replace("\\", "/")  # ex.: data/processado_*.csv
+            rel_path = os.path.relpath(caminho_saida, start=".").replace("\\", "/")
             ok_up, msg_up = gh_upload_file_from_local(
                 caminho_saida,
                 path_rel=rel_path,
@@ -241,12 +282,6 @@ st.divider()
 # 5) Gerenciar dados (Excluir)
 # -------------------------
 st.header("5) Gerenciar dados (Excluir)")
-
-def listar_arquivos(pasta: str):
-    if not os.path.isdir(pasta):
-        return []
-    full = [os.path.join(pasta, f) for f in os.listdir(pasta)]
-    return sorted([p for p in full if os.path.isfile(p)])
 
 col_g, col_info = st.columns([2, 1])
 with col_g:
@@ -288,9 +323,11 @@ with col_g:
             sucesso_gh = 0
             for nome_arq in selecao:
                 full_path = os.path.join(diretorio_salvar, nome_arq)
+                # Segurança: só permitir exclusão dentro da pasta de dados
                 if not os.path.abspath(full_path).startswith(os.path.abspath(diretorio_salvar) + os.sep):
                     st.error(f"Bloqueado (fora da pasta de dados): {full_path}")
                     continue
+                # Excluir localmente
                 try:
                     os.remove(full_path)
                     sucesso_local += 1
@@ -299,6 +336,7 @@ with col_g:
                     st.warning(f"Arquivo já não existe localmente: {full_path}")
                 except Exception as e:
                     st.error(f"Falha ao excluir localmente {full_path}: {e}")
+                # Excluir também do GitHub (opcional)
                 if excluir_github and gh_ok:
                     rel_path = os.path.relpath(full_path, start=".").replace("\\", "/")
                     ok, status_msg = gh_delete_file_from_repo(rel_path, message=f"chore: remove {rel_path} via app")
@@ -322,11 +360,7 @@ st.divider()
 # -------------------------
 st.header("Dashboard de Tendências de GPA")
 
-def listar_processados_locais(pasta: str):
-    todos = listar_arquivos(pasta)
-    return [p for p in todos if os.path.basename(p).startswith("processado_") and p.endswith(".csv")]
-
-# 6.1) Seletor de arquivo processado + opção de puxar do GitHub
+# 6.1) Seletor de arquivo processado + opção de puxar do GitHub quando necessário
 proc_locais = listar_processados_locais(diretorio_salvar)
 
 colsel1, colsel2 = st.columns([2, 1])
@@ -334,14 +368,17 @@ with colsel1:
     caminho_escolhido = None
     if proc_locais:
         nomes = [os.path.basename(p) for p in proc_locais]
-        # Seleciona automaticamente o mais recente, se necessário
+
         def _mais_recente(paths):
             try:
                 return max(paths, key=os.path.getmtime)
             except Exception:
                 return paths[-1]
-        if not st.session_state.get("_ultimo_arquivo_processado") or not os.path.exists(st.session_state["_ultimo_arquivo_processado"]):
+
+        if not st.session_state.get("_ultimo_arquivo_processado") or \
+           not os.path.exists(st.session_state["_ultimo_arquivo_processado"]):
             st.session_state["_ultimo_arquivo_processado"] = _mais_recente(proc_locais)
+
         atual_path = st.session_state["_ultimo_arquivo_processado"]
         idx_atual = nomes.index(os.path.basename(atual_path)) if os.path.basename(atual_path) in nomes else 0
         escolha = st.selectbox("Arquivo local para visualizar", nomes, index=idx_atual)
@@ -359,7 +396,10 @@ with colsel2:
         if st.button("Listar arquivos 'processado_' no GitHub"):
             ok, itens = gh_list_dir("data")
             if ok and isinstance(itens, list):
-                nomes_gh = [i["name"] for i in itens if i.get("type") == "file" and i.get("name", "").startswith("processado_") and i.get("name", "").endswith(".csv")]
+                nomes_gh = [i["name"] for i in itens
+                            if i.get("type") == "file"
+                            and i.get("name", "").startswith("processado_")
+                            and i.get("name", "").endswith(".csv")]
                 if not nomes_gh:
                     st.warning("Nenhum 'processado_*.csv' encontrado em data/ no GitHub.")
                 else:
@@ -388,23 +428,9 @@ caminho_dados = st.session_state.get("_ultimo_arquivo_processado")
 if caminho_dados and os.path.exists(caminho_dados):
     dados = pd.read_csv(caminho_dados)
 
-    # --- Helper: derivar Série a partir de Turma ---
-    def extrair_serie(txt: str) -> str:
-        if not isinstance(txt, str):
-            return ""
-        s = txt.lower().replace("º", "").strip()
-        m = re.search(r"(\d{1,2})\s*ano", s)
-        if m:
-            return f"{int(m.group(1))}º ano"
-        m = re.search(r"^(\d{1,2})", s)
-        if m:
-            return f"{int(m.group(1))}º ano"
-        return txt
-
-    aba1, aba2, aba3 = st.tabs([
+    aba1, aba2 = st.tabs([
         "GPA por disciplina e turma",
         "GPA por estudante e disciplina",
-        "GPA individual (série→turma→estudante)"
     ])
 
     with aba1:
@@ -425,31 +451,40 @@ if caminho_dados and os.path.exists(caminho_dados):
             fig2 = grafico_tendencia_gpa_por_estudante_disciplina(dados, disciplinas=sel_disc2, estudantes=sel_est)
             st.altair_chart(fig2, use_container_width=True)
 
-    with aba3:
-        dados_ind = dados.copy()
-        dados_ind["Serie"] = dados_ind["Turma"].astype(str).apply(extrair_serie)
-        series_disp = sorted([s for s in dados_ind["Serie"].dropna().unique() if str(s).strip() != ""])
-        if not series_disp:
-            st.info("Não foi possível derivar a Série a partir da Turma. Verifique os dados.")
-        else:
-            serie_sel = st.selectbox("Selecione a série", series_disp, index=0)
-            turmas_disp = sorted(dados_ind.query("Serie == @serie_sel")["Turma"].dropna().unique())
-            turma_sel = st.selectbox("Selecione a turma", turmas_disp, index=0)
-            alunos_disp = sorted(dados_ind.query("Serie == @serie_sel and Turma == @turma_sel")["Estudante"].dropna().unique())
-            if not alunos_disp:
-                st.info("Não há estudantes para os filtros selecionados.")
+    # Aba 3 (GPA individual) – só se a função estiver disponível
+    if _GRAFICO_INDIVIDUAL_OK and grafico_gpa_individual_estudante_disciplinas:
+        aba3 = st.tabs(["GPA individual (série→turma→estudante)"])[0]
+        with aba3:
+            dados_ind = dados.copy()
+            dados_ind["Serie"] = dados_ind["Turma"].astype(str).apply(extrair_serie)
+            series_disp = sorted([s for s in dados_ind["Serie"].dropna().unique() if str(s).strip() != ""])
+            if not series_disp:
+                st.info("Não foi possível derivar a Série a partir da Turma. Verifique os dados.")
             else:
-                aluno_sel = st.selectbox("Selecione o estudante", alunos_disp, index=0)
-                disps = sorted(dados_ind.query("Serie == @serie_sel and Turma == @turma_sel and Estudante == @aluno_sel")["Disciplina"].dropna().unique())
-                if not disps:
-                    st.info("Não há disciplinas para este estudante.")
+                serie_sel = st.selectbox("Selecione a série", series_disp, index=0)
+                turmas_disp = sorted(dados_ind.query("Serie == @serie_sel")["Turma"].dropna().unique())
+                turma_sel = st.selectbox("Selecione a turma", turmas_disp, index=0)
+                alunos_disp = sorted(dados_ind.query("Serie == @serie_sel and Turma == @turma_sel")["Estudante"].dropna().unique())
+                if not alunos_disp:
+                    st.info("Não há estudantes para os filtros selecionados.")
                 else:
-                    dis_sel3 = st.multiselect("Selecione disciplinas", disps, default=disps[:min(4, len(disps))])
-                    if dis_sel3:
-                        dados_f = dados_ind.query("Serie == @serie_sel and Turma == @turma_sel and Estudante == @aluno_sel")
-                        fig3 = grafico_gpa_individual_estudante_disciplinas(dados_f, estudante=aluno_sel, disciplinas=dis_sel3)
-                        st.altair_chart(fig3, use_container_width=True)
+                    aluno_sel = st.selectbox("Selecione o estudante", alunos_disp, index=0)
+                    disps = sorted(dados_ind.query(
+                        "Serie == @serie_sel and Turma == @turma_sel and Estudante == @aluno_sel"
+                    )["Disciplina"].dropna().unique())
+                    if not disps:
+                        st.info("Não há disciplinas para este estudante.")
                     else:
-                        st.info("Selecione pelo menos uma disciplina.")
+                        dis_sel3 = st.multiselect("Selecione disciplinas", disps, default=disps[:min(4, len(disps))])
+                        if dis_sel3:
+                            dados_f = dados_ind.query(
+                                "Serie == @serie_sel and Turma == @turma_sel and Estudante == @aluno_sel"
+                            )
+                            fig3 = grafico_gpa_individual_estudante_disciplinas(dados_f, estudante=aluno_sel, disciplinas=dis_sel3)
+                            st.altair_chart(fig3, use_container_width=True)
+                        else:
+                            st.info("Selecione pelo menos uma disciplina.")
+    else:
+        st.warning("O gráfico individual não foi carregado. Verifique/atualize o arquivo 'gpa/graficos.py' no GitHub.")
 else:
     st.info("Carregue/baixe ou selecione um arquivo processado para visualizar os gráficos.")

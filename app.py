@@ -1,14 +1,13 @@
 # app.py — Aplicação Streamlit (PT-BR)
 # - Upload em lote (vários arquivos)
 # - Processa e salva em ./data
-# - Inferência automática de Série/Turma/Trimestre a partir do conteúdo e/ou nome do arquivo
-# - Opcional: envia cópia para GitHub
-# - Dashboard carrega TODOS os processados (./data) e oferece sincronizar do GitHub
-# - Filtros globais + Tabela sempre aparente + Gráficos comparativos
+# - Inferência automática de Série/Turma/Trimestre (conteúdo e/ou nome do arquivo)
+# - Normalização de textos para evitar mojibake (Ã, Â, �)
+# - Dashboard multi-arquivo com filtros globais + tabela sempre aparente
+# - Integração opcional com GitHub (persistência/baixa)
 
 import os
 import re
-import io
 import time
 import pandas as pd
 import streamlit as st
@@ -30,7 +29,7 @@ from gpa.processamento import (
     aplicar_mapeamento_gpa,
 )
 
-# Imports dos gráficos com fallback seguro (evita quebra se commit parcial ocorrer)
+# Imports dos gráficos com fallback seguro
 try:
     from gpa.graficos import (
         grafico_tendencia_gpa_por_disciplina_turma,
@@ -61,19 +60,33 @@ from gpa.github_api import (
 # -------------------------
 st.set_page_config(page_title="Conversor de Notas → GPA", layout="wide")
 st.title("Conversor de Notas → GPA (Streamlit)")
-st.caption("Inferência automática de Série/Turma/Trimestre pelo conteúdo e/ou pelo nome do arquivo.")
+st.caption("Inferência automática de Série/Turma/Trimestre e correção de textos com acentuação.")
 
 # -------------------------
-# 0) Helpers (Série/Turma/Trimestre)
+# 0) Helpers (mojibake + série/turma/trimestre)
 # -------------------------
-_ROMAN = {"i": 1, "ii": 2, "iii": 3}
-_ROMAN_INV = {1: "I", 2: "II", 3: "III"}
+_MOJIBAKE_TOKENS = ("Ã", "Â", "�")
+
+def _fix_mojibake(text):
+    if not isinstance(text, str):
+        return text
+    if any(tok in text for tok in _MOJIBAKE_TOKENS):
+        try:
+            return text.encode("latin-1").decode("utf-8")
+        except Exception:
+            return text
+    return text
+
+def normalizar_textos_df(df: pd.DataFrame) -> pd.DataFrame:
+    cols = [c for c in ("Disciplina", "Avaliacao", "Turma", "Estudante") if c in df.columns]
+    for c in cols:
+        df[c] = df[c].astype(str).map(_fix_mojibake).str.strip()
+    return df
 
 def _norm_text(s: str) -> str:
     return re.sub(r"\s+", " ", s.replace("º", "").strip()) if isinstance(s, str) else ""
 
 def extrair_serie_de_texto_turma(txt: str) -> str | None:
-    """De '6º ano A', '6 ano C', '6A', '6 C', '6ºC' → '6º ano' (ou None)."""
     s = _norm_text(txt).lower()
     m = re.search(r"\b(\d{1,2})\s*ano\b", s)
     if m:
@@ -84,29 +97,24 @@ def extrair_serie_de_texto_turma(txt: str) -> str | None:
     return None
 
 def extrair_turma_letra_de_texto_turma(txt: str) -> str | None:
-    """De '6º ano A', 'Turma C', '6 C', '6A' → 'A'/'C' (ou None). Evita confundir com 'I' de trimestre."""
     s = _norm_text(txt).upper()
-    # Preferir letra logo após a série (ex.: '6 A', '6A', '6 - A')
     m = re.search(r"\b\d{1,2}\D*([A-Z])\b", s)
-    if m and m.group(1) != "I":  # evita confundir com 'I' (romano)
+    if m and m.group(1) != "I":
         return m.group(1)
-    # Caso geral: procurar uma letra que NÃO seja I e não esteja perto de 'TRIMESTRE'
-    candidatos = re.findall(r"\b([A-Z])\b", s)
-    for c in candidatos:
+    letras = re.findall(r"\b([A-Z])\b", s)
+    for c in letras:
         if c != "I":
             return c
     return None
 
-def parse_filename_metadata(fname: str) -> tuple[str | None, str | None, int | None]:
-    """
-    Tenta extrair (Serie, TurmaLetra, Trimestre) do nome do arquivo.
-    Exemplos: '6º C- I TRIMESTRE.csv', '7 A - 1º Trimestre.xlsx', '9B_II_TRIMESTRE.csv'
-    """
+_ROMAN = {"i": 1, "ii": 2, "iii": 3}
+
+def parse_filename_metadata(fname: str):
     base = os.path.basename(fname)
     s = _norm_text(base)
     slow = s.lower()
 
-    # Série: '6º ano', '6 ano', ou primeiro número 1-12
+    # Série
     serie = None
     m = re.search(r"\b(\d{1,2})\s*ano\b", slow)
     if m:
@@ -116,9 +124,9 @@ def parse_filename_metadata(fname: str) -> tuple[str | None, str | None, int | N
         if m:
             serie = f"{int(m.group(1))}º ano"
 
-    # Trimestre: romano I/II/III ou 1/2/3 (+ opcional 'º')
+    # Trimestre
     trimestre = None
-    m = re.search(r"\b([ivx]{1,3})\s*tri", slow)  # romano antes de "tri"
+    m = re.search(r"\b([ivx]{1,3})\s*tri", slow)
     if m:
         trimestre = _ROMAN.get(m.group(1), None)
     if trimestre is None:
@@ -126,13 +134,12 @@ def parse_filename_metadata(fname: str) -> tuple[str | None, str | None, int | N
         if m:
             trimestre = int(m.group(1))
 
-    # Turma: letra única (preferir antes de um hífen)
+    # Turma
     turma = None
     m = re.search(r"\b\d{1,2}\D*([A-Z])\s*[-–—]", s.upper())
     if m and m.group(1) != "I":
         turma = m.group(1)
     if turma is None:
-        # fallback: primeira letra que não seja 'I'
         letras = re.findall(r"\b([A-Z])\b", s.upper())
         for L in letras:
             if L != "I":
@@ -141,27 +148,16 @@ def parse_filename_metadata(fname: str) -> tuple[str | None, str | None, int | N
 
     return serie, turma, trimestre
 
-def fundir_metadados(serie_txt: str | None, turma_letra: str | None,
-                     serie_fname: str | None, turma_fname: str | None) -> tuple[str | None, str | None]:
-    """Dá prioridade ao que veio do conteúdo; se faltar, completa com o que veio do nome do arquivo."""
-    serie_final = serie_txt or serie_fname
-    turma_final = turma_letra or turma_fname
-    return serie_final, turma_final
-
 def inferir_serie_turma_trimestre(df: pd.DataFrame, col_turma: str, fname: str,
-                                  trimestre_ui: int | None) -> tuple[str | None, str | None, int | None]:
-    """Infere (Serie, Turma, Trimestre) combinando conteúdo e nome do arquivo."""
+                                  trimestre_ui: int | None):
     # Conteúdo
     serie_txt = None
     turma_letra = None
     if col_turma in df.columns:
         valores = df[col_turma].dropna().astype(str)
-        # Tenta encontrar uma série consistente nos valores de turma
         poss_series = valores.apply(extrair_serie_de_texto_turma).dropna()
         if not poss_series.empty:
-            # pega a mais frequente
             serie_txt = poss_series.mode().iloc[0]
-        # Tenta extrair letra de turma
         poss_turmas = valores.apply(extrair_turma_letra_de_texto_turma).dropna()
         if not poss_turmas.empty:
             turma_letra = poss_turmas.mode().iloc[0]
@@ -170,9 +166,10 @@ def inferir_serie_turma_trimestre(df: pd.DataFrame, col_turma: str, fname: str,
     serie_fname, turma_fname, trimestre_fname = parse_filename_metadata(fname)
 
     # Fusão
-    serie_final, turma_final = fundir_metadados(serie_txt, turma_letra, serie_fname, turma_fname)
+    serie_final = serie_txt or serie_fname
+    turma_final = turma_letra or turma_fname
 
-    # Trimestre: conteúdo (se existir) vence; senão nome; senão UI
+    # Trimestre
     if "Trimestre" in df.columns and df["Trimestre"].notna().any():
         try:
             tri_val = int(pd.to_numeric(df["Trimestre"], errors="coerce").mode().iloc[0])
@@ -200,7 +197,6 @@ def listar_processados_locais(pasta: str):
     ]
 
 def carregar_todos_processados(pasta: str) -> pd.DataFrame:
-    """Concatena todos os CSVs processados da pasta e tenta garantir coluna 'Serie'."""
     files = listar_processados_locais(pasta)
     if not files:
         return pd.DataFrame()
@@ -215,15 +211,16 @@ def carregar_todos_processados(pasta: str) -> pd.DataFrame:
     out = pd.concat(dfs, ignore_index=True)
 
     # Garante colunas essenciais
-    for c in ["Estudante", "Turma", "Disciplina", "Trimestre", "P1", "Conclusiva", "Media", "GPA"]:
+    base_cols = ["Estudante", "Turma", "Disciplina", "Trimestre", "P1", "Conclusiva", "Media", "GPA"]
+    for c in base_cols:
         if c not in out.columns:
             out[c] = pd.NA
 
-    # MediaPadronizada pode não existir em arquivos antigos → derivar
+    # Deriva MediaPadronizada se ausente
     if "MediaPadronizada" not in out.columns:
         out["MediaPadronizada"] = out["Media"].apply(lambda x: (x/10.0) if pd.notna(x) and x > 10 else x)
 
-    # Série: se não existir ou vier vazia, tentar derivar de Turma (fallback)
+    # Série: se não existir ou vier vazia, derivar de Turma
     if "Serie" not in out.columns:
         out["Serie"] = out["Turma"].astype(str).apply(lambda t: extrair_serie_de_texto_turma(t) or "")
     else:
@@ -232,10 +229,12 @@ def carregar_todos_processados(pasta: str) -> pd.DataFrame:
             lambda t: extrair_serie_de_texto_turma(t) or ""
         )
 
+    # Corrige mojibake em textos
+    out = normalizar_textos_df(out)
     return out
 
 # -------------------------
-# 1) Upload (agora em lote)
+# 1) Upload (em lote)
 # -------------------------
 st.header("1) Envie o(s) arquivo(s) de notas (CSV/XLSX)")
 arquivos = st.file_uploader(
@@ -245,7 +244,7 @@ arquivos = st.file_uploader(
 )
 
 # -------------------------
-# 2) Mapeamento de esquema & rótulos (baseado no primeiro arquivo)
+# 2) Mapeamento de esquema & rótulos
 # -------------------------
 st.header("2) Mapeie as colunas do seu arquivo")
 
@@ -253,6 +252,7 @@ amostra_colunas = ["Nome", "Turma", "DescrMateria", "DescrAvaliacao", "Nota", "T
 if arquivos:
     f0 = arquivos[0]
     df_preview = leitura_robusta(f0, nrows=200)
+    df_preview = normalizar_textos_df(df_preview)  # <<< correção de textos na prévia
     amostra_colunas = list(df_preview.columns)
     st.caption(f"Prévia do primeiro arquivo: **{f0.name}**")
     st.dataframe(df_preview.head(20), use_container_width=True)
@@ -357,7 +357,7 @@ salvar_no_github_flag = st.checkbox(
 )
 
 # -------------------------
-# 4) Processar & Salvar (em lote) — com inferência de Série/Turma/Trimestre
+# 4) Processar & Salvar (em lote) — com inferência + normalização de textos
 # -------------------------
 st.header("4) Processar e salvar dados")
 diretorio_salvar = st.text_input("Pasta para salvar dados (no repositório)", value=DIRETORIO_DADOS_PADRAO)
@@ -368,18 +368,17 @@ if st.button("Processar arquivo(s)", type="primary", disabled=(not arquivos)):
     total_ok = 0
     enviados_gh = 0
     for f in arquivos:
-        # reposiciona ponteiro e lê
         try:
             f.seek(0)
         except Exception:
             pass
         df = leitura_robusta(f)
 
-        # Normalização de nota (vírgula → ponto)
+        # Normalização de nota
         if coluna_nota in df.columns:
             df[coluna_nota] = converter_decimal(df[coluna_nota])
 
-        # Renomear colunas principais (independente da ordem original)
+        # Renomear colunas principais
         try:
             df = df.rename(
                 columns={
@@ -396,12 +395,15 @@ if st.button("Processar arquivo(s)", type="primary", disabled=(not arquivos)):
             st.error(f"[{f.name}] Falha ao padronizar colunas: {e}")
             continue
 
-        # Inferência de Série/Turma/Trimestre (conteúdo + nome do arquivo + UI)
+        # Corrige mojibake nos textos
+        df = normalizar_textos_df(df)
+
+        # Inferência de Série/Turma/Trimestre
         serie_final, turma_final, tri_final = inferir_serie_turma_trimestre(
             df, col_turma="Turma", fname=getattr(f, "name", "arquivo"), trimestre_ui=trimestre_constante
         )
 
-        # Completa Turma se estiver vazia e conseguimos a letra pelo nome do arquivo
+        # Completa Turma se necessário
         if ("Turma" not in df.columns) or df["Turma"].isna().all() or (df["Turma"].astype(str).str.strip() == "").all():
             if turma_final:
                 df["Turma"] = turma_final
@@ -417,15 +419,14 @@ if st.button("Processar arquivo(s)", type="primary", disabled=(not arquivos)):
             rotulos_conclusiva=rotulos_conclusiva,
         )
 
-        # Insere a coluna Serie já no dataframe de médias
-        medias["Serie"] = serie_final if serie_final else ""   # pode ficar vazio se impossível inferir
-        # Garantia: mantém Turma conforme veio (ou completada)
-        # (Em 'medias', Turma já foi carregada na agregação)
+        # 2) Inserir Serie e normalizar textos
+        medias["Serie"] = serie_final if serie_final else ""
+        medias = normalizar_textos_df(medias)
 
-        # 2) Aplicar mapeamento Média → GPA (com padronização de escala)
+        # 3) Aplicar mapeamento Média → GPA
         gpa_df = aplicar_mapeamento_gpa(medias, tabela_map, escala=escala_param)
 
-        # 3) Persistir dados localmente
+        # 4) Persistir dados
         ts = time.strftime("%Y%m%d-%H%M%S")
         nome_base = os.path.splitext(f.name)[0] if hasattr(f, "name") else "arquivo"
         caminho_saida = os.path.join(diretorio_salvar, f"processado_{nome_base}_{ts}.csv")
@@ -437,7 +438,7 @@ if st.button("Processar arquivo(s)", type="primary", disabled=(not arquivos)):
             st.error(f"[{f.name}] Falha ao salvar: {e}")
             continue
 
-        # 4) (Opcional) enviar cópia ao GitHub
+        # 5) (Opcional) enviar cópia ao GitHub
         if salvar_no_github_flag:
             if gh_ok_flag:
                 rel_path = os.path.relpath(caminho_saida, start=".").replace("\\", "/")
@@ -455,7 +456,6 @@ if st.button("Processar arquivo(s)", type="primary", disabled=(not arquivos)):
                 st.warning(f"[{f.name}] Secrets do GitHub ausentes/incompletos: {gh_err_msg}")
 
     st.info(f"Resumo do processamento: {total_ok} arquivo(s) salvo(s) localmente; {enviados_gh} enviado(s) ao GitHub.")
-    # Atualiza seleção para forçar recarga
     st.session_state["_ultimo_arquivo_processado"] = None
 
 st.divider()
@@ -535,11 +535,11 @@ with col_info:
 st.divider()
 
 # -------------------------
-# 6) Dashboard (multi-arquivo + filtros globais + tabela sempre aparente)
+# 6) Dashboard (multi-arquivo + filtros globais + tabela)
 # -------------------------
 st.header("Dashboard com filtros globais e comparação entre turmas")
 
-# 6.0) Sincronizar tudo do GitHub → ./data (opcional)
+# 6.0) Sincronização opcional com GitHub
 gh_ok2, gh_err2 = gh_credentials_ok()
 with st.expander("Sincronização com GitHub (opcional)"):
     if gh_ok2:
@@ -623,7 +623,7 @@ else:
 
     st.divider()
 
-    # ---- Gráficos (usam os dados filtrados) ----
+    # ---- Gráficos ----
     aba1, aba2 = st.tabs([
         "Comparação por disciplina × turma (GPA médio por trimestre)",
         "Tendência por estudante × disciplina (GPA)",
@@ -643,7 +643,6 @@ else:
             fig2 = grafico_tendencia_gpa_por_estudante_disciplina(dados_filtrados, disciplinas=disc_sel, estudantes=est_sel)
             st.altair_chart(fig2, use_container_width=True)
 
-    # Aba 3 (individual) – se a função existir
     if _GRAFICO_INDIVIDUAL_OK and grafico_gpa_individual_estudante_disciplinas:
         aba3 = st.tabs(["GPA individual (série→turma→estudante)"])[0]
         with aba3:

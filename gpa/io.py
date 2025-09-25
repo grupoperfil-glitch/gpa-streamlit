@@ -31,14 +31,14 @@ def _detectar_codificacao(bruto: bytes) -> str:
 def _try_read_csv_from_bytes(bruto: bytes, nrows: Optional[int] = None) -> Optional[pd.DataFrame]:
     """
     Tenta ler CSV a partir de bytes usando:
-      - múltiplos encodings: detectado, utf-8, utf-8-sig, latin-1, cp1252
+      - múltiplos encodings: UTF-8/UTF-8-SIG (prioridade), detectado, latin-1, cp1252
       - múltiplos separadores: ';', ',', '\\t', e auto (sep=None)
     Último recurso: encoding_errors='ignore' para não quebrar por caracteres inválidos.
     """
     enc_detect = _detectar_codificacao(bruto)
     enc_candidates = []
-    for e in [enc_detect, "utf-8", "utf-8-sig", "latin-1", "cp1252"]:
-        # evita duplicados mantendo ordem
+    # Preferimos UTF-8 primeiro para evitar mojibake quando chardet "chuta" cp1252
+    for e in ["utf-8", "utf-8-sig", enc_detect, "latin-1", "cp1252"]:
         if e and e.lower() not in [x.lower() for x in enc_candidates]:
             enc_candidates.append(e)
 
@@ -69,7 +69,7 @@ def _try_read_csv_from_bytes(bruto: bytes, nrows: Optional[int] = None) -> Optio
             nrows=nrows,
             engine="python",
             encoding="utf-8",
-            encoding_errors="ignore",  # disponível no pandas >= 1.4
+            encoding_errors="ignore",  # pandas >= 1.4
         )
         return df
     except Exception:
@@ -113,7 +113,6 @@ def leitura_robusta(arquivo_ou_buffer, nrows: Optional[int] = None) -> pd.DataFr
         raise ValueError("Não foi possível ler o arquivo (CSV/Excel) — verifique encoding e formato.")
 
     # 4) Caso não sejam bytes (ex.: caminho no disco)
-    #    Tenta CSV com múltiplos encodings/seps, depois Excel, depois ignore.
     enc_candidates = ["utf-8", "utf-8-sig", "latin-1", "cp1252"]
     seps = [";", ",", "\t", None]
     for enc in enc_candidates:

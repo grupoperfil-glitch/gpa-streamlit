@@ -38,10 +38,8 @@ def grafico_gpa_individual_estudante_disciplinas(df: pd.DataFrame, estudante: st
     """
     dados = df[(df["Estudante"] == estudante) & (df["Disciplina"].isin(disciplinas))].copy()
     if dados.empty:
-        # Mensagem amigável quando não há dados
         return alt.Chart(pd.DataFrame({"msg": ["Sem dados para os filtros atuais."]})) \
-                 .mark_text(size=16) \
-                 .encode(text="msg")
+                 .mark_text(size=16).encode(text="msg")
     chart = alt.Chart(dados).mark_line(point=True).encode(
         x=alt.X("Trimestre:O", title="Trimestre"),
         y=alt.Y("GPA:Q", title="GPA"),
